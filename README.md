@@ -8,15 +8,15 @@ Furthermore, you can find some methods and skills of Feature Engineering and Dat
 
 ## II. By Problem
 #### (1) stocks and time series
-[Optiver Realized Volatility Prediction](https://www.runoob.com) ([kaggle link](https://www.kaggle.com/c/optiver-realized-volatility-prediction/overview))
+[Optiver Realized Volatility Prediction](https://github.com/ArtificialIntelligenceBirdMan/kaggle/tree/main/Optiver%20Realized%20Volatility%20Prediction) ([kaggle link](https://www.kaggle.com/c/optiver-realized-volatility-prediction/overview))
 
 
 ## III. By Technology
 #### (1) Neural Network
-[Optiver Realized Volatility Prediction](https://www.runoob.com) ([kaggle link](https://www.kaggle.com/c/optiver-realized-volatility-prediction/overview))
+[Optiver Realized Volatility Prediction](https://github.com/ArtificialIntelligenceBirdMan/kaggle/tree/main/Optiver%20Realized%20Volatility%20Prediction) ([kaggle link](https://www.kaggle.com/c/optiver-realized-volatility-prediction/overview))
 
 #### (2) lightGBM
-[Optiver Realized Volatility Prediction](https://www.runoob.com) ([kaggle link](https://www.kaggle.com/c/optiver-realized-volatility-prediction/overview))
+[Optiver Realized Volatility Prediction](https://github.com/ArtificialIntelligenceBirdMan/kaggle/tree/main/Optiver%20Realized%20Volatility%20Prediction) ([kaggle link](https://www.kaggle.com/c/optiver-realized-volatility-prediction/overview))
 
 #### (3) Time Series
 
