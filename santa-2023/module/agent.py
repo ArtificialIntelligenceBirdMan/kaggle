@@ -294,8 +294,6 @@ def train_deepcube_agent(agent : Agent, M : int=5000, eps : float=0.05, K : int=
         if save_epoch > 0 and (epoch + 1) % save_epoch == 0:
             model_name = "cost_model" if agent.name is None else f"{agent.name}_cost_model"
             agent.cost_model.save_weights(f"{model_dir}/{model_name}_{epoch+1}.h5")
-            # 上传到 oss
-            os.system(f"aistudio_oss_tool put {model_dir}/{model_name}_{epoch+1}.h5 >> {model_dir}/{model_name}.log")
 
         # 重置 metric
         loss_metric.reset_states()
