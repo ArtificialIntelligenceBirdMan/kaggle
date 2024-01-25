@@ -4,6 +4,12 @@ from abc import abstractmethod
 
 import tensorflow as tf
 
+class PuzzleSubType:
+    STANDARD = "S"      # for puzzle [A;A;A;A;B;B;B;B;...]
+    CROSS = "C"         # for puzzle [A;B;A;B;...]
+    SEQUENTIAL = "N"    # for puzzle [N0;N1;N2;N3;...]
+
+
 # Puzzle 基类
 class Puzzle:
     @abstractmethod
@@ -12,26 +18,31 @@ class Puzzle:
    
     # 将 字符状态 转换为 数值向量形式
     @staticmethod
-    def to_state_vec(state : Union[List[str], Tuple[str]]):
-        return [ord(s) - ord("A") for s in state]
+    def to_state_vec(state : Union[List[str], Tuple[str]], sub_type : str=PuzzleSubType.STANDARD):
+        if sub_type == PuzzleSubType.SEQUENTIAL:
+            return [int(s[1:]) for s in state]
+        else:
+            return [ord(s) - ord("A") for s in state]
     
     # 将 数值向量形式的状态 转换为 字符形式
     @staticmethod
-    def to_state_str(state : Union[List[int], Tuple[int]]):
-        return [chr(s + ord("A")) for s in state]
-
+    def to_state_str(state : Union[List[int], Tuple[int]], sub_type : str=PuzzleSubType.STANDARD):
+        if sub_type == PuzzleSubType.SEQUENTIAL:
+            return [f"N{i}" for i in state]
+        else:
+            return [chr(s + ord("A")) for s in state]
 
 class PuzzleInfo(Puzzle):
-    def __init__(self, puzzle_type : str, goal_state : str) -> None:
+    def __init__(self, puzzle_type : str, goal_state : str, sub_type : str=PuzzleSubType.STANDARD) -> None:
         self.puzzle_type = puzzle_type
+        self.sub_type = sub_type
         
         self.goal_state = goal_state.split(";")
-        self.goal_state_vec = self.to_state_vec(self.goal_state)
+        self.goal_state_vec = self.to_state_vec(self.goal_state, sub_type)
         
         # 保存 状态长度 state_length 和 每个位置的 状态深度 state_depth
         self.state_length = len(self.goal_state)
         self.state_depth = max(self.goal_state_vec) + 1 # 从 0 开始计数
-
 
 class PuzzleAction(Puzzle):
     def __init__(self, puzzle_type : str, moves : dict):
@@ -88,3 +99,21 @@ class PuzzleNode:
     
     def __eq__(self, other):
         return self.state == other.state
+
+def get_puzzle_sub_type(puzzle_type : str, goal_state : list):
+    if puzzle_type.startswith("cube"):
+        if goal_state[0] and goal_state[1] == "A":
+            sub_type = PuzzleSubType.STANDARD
+        elif goal_state[0] == "A" and goal_state[1] == "B":
+            sub_type = PuzzleSubType.CROSS
+        elif goal_state[0] == "N0":
+            sub_type = PuzzleSubType.SEQUENTIAL
+        else:
+            raise ValueError("Unknown goal state")
+    else:
+        if goal_state[0] == "N0":
+            sub_type = PuzzleSubType.SEQUENTIAL
+        else:
+            sub_type = PuzzleSubType.STANDARD
+    
+    return sub_type

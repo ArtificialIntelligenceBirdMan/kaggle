@@ -163,7 +163,7 @@ class Agent:
 
 def train_deepcube_agent(agent : Agent, M : int=5000, eps : float=0.05, K : int=30,
                          batch_size : int=10000, Epochs : int=1000, lr : float=0.001, warm_up : int=5, 
-                         verbose : int=100, save_epoch : int=1000, show : bool=False):
+                         verbose : int=100, save_epoch : int=1000, show : bool=False, pre_train : str=None):
     """
     Parameters
     ----------
@@ -188,32 +188,13 @@ def train_deepcube_agent(agent : Agent, M : int=5000, eps : float=0.05, K : int=
         The frequency to save model.
     show : bool, default = False
         Whether to use Animator to show training information.
+    pre_train : str, default = None
+        The pre-trained model path.
     """
-
-    # 定义损失和优化器
-    optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
-    loss_func = tf.keras.losses.MeanSquaredError(reduction=tf.keras.losses.Reduction.NONE)
-
-    # 拷贝模型
-    cost_model_ = DeepCube(**agent.cost_model.get_config())
-    cost_model_.build(input_shape=(None, agent.puzzle.state_length))
-    agent.cost_model.build(input_shape=(None, agent.puzzle.state_length))
-    agent.cost_model.set_weights(cost_model_.get_weights())
-
-    # 记录 agent 更新次数和未更新次数
-    update_cnt, not_update_cnt = 0, 0
-
-    # 创建数据集
-    current_K = 1
-    dataset = PuzzleDataset(agent, K=current_K, batch_size=batch_size, M=M)
-
-    # 记录 loss 和 cost
-    loss_metric = tf.keras.metrics.Mean()
-    cost_metric = tf.keras.metrics.Mean()
-
     # 创建保存模型的文件夹
     puzzle_type = agent.puzzle.puzzle_type.replace("/", "x")
-    model_dir, log_dir = f"./model/{puzzle_type}", f"./logs/{puzzle_type}"
+    sub_type = agent.puzzle.sub_type
+    model_dir, log_dir = f"./model/{puzzle_type}_{sub_type}", f"./logs/{puzzle_type}_{sub_type}"
     os.makedirs(model_dir, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
 
@@ -225,6 +206,37 @@ def train_deepcube_agent(agent : Agent, M : int=5000, eps : float=0.05, K : int=
     else:
         animator = None
     logger = Logger(path_dir=log_dir, name=agent.name)
+
+
+    # 定义损失和优化器
+    optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
+    loss_func = tf.keras.losses.MeanSquaredError(reduction=tf.keras.losses.Reduction.NONE)
+
+    current_K = 1
+
+    # 拷贝模型
+    agent.cost_model.build(input_shape=(None, agent.puzzle.state_length))
+    if pre_train is not None:
+        try:
+            agent.cost_model.load_weights(pre_train)
+            msg = f"load pre-trained model from path {pre_train}"
+            current_K = K
+        except FileNotFoundError:
+            msg = "no pre-trained model found, start training from scratch."
+        logger.info(0, msg)
+    cost_model_ = DeepCube(**agent.cost_model.get_config())
+    cost_model_.build(input_shape=(None, agent.puzzle.state_length))
+    cost_model_.set_weights(agent.cost_model.get_weights())
+
+    # 记录 agent 更新次数和未更新次数
+    update_cnt, not_update_cnt = 0, 0
+
+    # 创建数据集
+    dataset = PuzzleDataset(agent, K=current_K, batch_size=batch_size, M=M)
+
+    # 记录 loss 和 cost
+    loss_metric = tf.keras.metrics.Mean()
+    cost_metric = tf.keras.metrics.Mean()
 
     # define the training loop
     for epoch in range(Epochs):
