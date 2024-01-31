@@ -3,6 +3,10 @@ from tensorflow import keras
 
 import numpy as np
 
+import concurrent.futures
+from threading import Thread
+from queue import Queue
+
 from typing import Union, List, Tuple, Dict, Any, Optional
 from abc import abstractmethod
 
@@ -241,27 +245,28 @@ class PuzzleDataset:
         self.batch_size = batch_size
         self.M = M
 
+        self.num_of_act = len(self.agent.actions)
+        self.state_len = self.agent.puzzle.state_length
+        self.goal_state = tf.constant(self.agent.puzzle.goal_state_vec, dtype=tf.int32)[None, :]
+        self.tf_actions = tf.stack(list(self.agent.actions.tf_actions.values()))
+
         self.dataset = self.create_puzzle_dataset()
 
 
-    @tf.function(input_signature=[tf.TensorSpec(shape=(None, None), dtype=tf.int32),
-                                  tf.TensorSpec(shape=(None,), dtype=tf.int32),
-                                  tf.TensorSpec(shape=(), dtype=tf.int32),
-                                  tf.TensorSpec(shape=(), dtype=tf.int32),
-                                  tf.TensorSpec(shape=(), dtype=tf.int32)])
-    def generate_batch(self, tf_actions, goal_state, num_of_act, state_len, K):
+    @tf.function(input_signature=[tf.TensorSpec(shape=(), dtype=tf.int32),])
+    def generate_batch(self, K):
         # 从 [1, K] 的均匀分布中采样 scrambling steps
         steps = tf.random.uniform(shape=(self.batch_size, 1), minval=1, maxval=K+1, dtype=tf.int32)
 
         # 随机采样 (batch_size, K) 个置换
         # scrambs 形状为 (batch_size, K, state_len)
         scrambs_idx = tf.random.uniform(
-            minval=0, maxval=num_of_act, 
+            minval=0, maxval=self.num_of_act, 
             shape=(self.batch_size, K), dtype=tf.int32)
-        scrambs = tf.gather(tf_actions, scrambs_idx)
+        scrambs = tf.gather(self.tf_actions, scrambs_idx)
 
         # 生成单位置换，形状为 (batch_size, K, state_len)
-        identity = tf.range(state_len)
+        identity = tf.range(self.state_len)
         identity = tf.tile(identity[None, None, :], [self.batch_size, K, 1])
 
         # 根据 steps 创建 mask
@@ -269,14 +274,14 @@ class PuzzleDataset:
         # 第一步，利用广播机制，得到 mask 的形状为 (batch_size, K)
         mask = tf.range(K)[None, :] < steps
         # 第二步，扩展 mask 维度，得到形状为 (batch_size, K, state_len)
-        mask = tf.tile(mask[:, :, None], [1, 1, state_len])
+        mask = tf.tile(mask[:, :, None], [1, 1, self.state_len])
         mask = tf.cast(mask, tf.int32)
 
         # 根据 mask 将 scrambs 中超过 steps 的位置置为 identity
         scrambs = scrambs * mask + identity * (1 - mask)
 
         # 最后，在 goal_state 上应用所有的置换，得到提供给模型的初始状态
-        init_state = tf.tile(goal_state[None, :], [self.batch_size, 1])
+        init_state = tf.tile(self.goal_state, [self.batch_size, 1])
         for k in range(K):
             init_state = tf.gather(init_state, scrambs[:, k, :], batch_dims=1)
 
@@ -289,22 +294,15 @@ class PuzzleDataset:
         return init_state, labels, steps
 
     def create_puzzle_dataset(self):
-        def create_generator(tf_actions, goal_state, num_of_act, state_len):
+        def create_generator():
             for _ in range(self.M):
-                init_state, labels, steps = self.generate_batch(
-                    tf_actions, goal_state, num_of_act, state_len, self.K)
+                init_state, labels, steps = self.generate_batch(self.K)
                 yield init_state, labels, steps
-
-        # 获取目标状态
-        goal_state = tf.constant(self.agent.puzzle.goal_state_vec, dtype=tf.int32)
-        state_len = self.agent.puzzle.state_length
-        num_of_act = len(self.agent.actions)
-        tf_actions = tf.stack(list(self.agent.actions.tf_actions.values()))
         
         dataset = tf.data.Dataset.from_generator(
-            generator=lambda : create_generator(tf_actions, goal_state, num_of_act, state_len),
+            generator=lambda : create_generator(),
             output_signature=(
-                tf.TensorSpec(shape=(self.batch_size, state_len), dtype=tf.int32),
+                tf.TensorSpec(shape=(self.batch_size, self.state_len), dtype=tf.int32),
                 tf.TensorSpec(shape=(self.batch_size, 1), dtype=tf.float32),
                 tf.TensorSpec(shape=(self.batch_size, 1), dtype=tf.int32))
             )
@@ -325,13 +323,106 @@ class PuzzleDataset:
         # 更新 dataset
         self.dataset = self.create_puzzle_dataset()
 
-# class ParallelPuzzleDataset:
-#     def __init__(self, agent : Agent, gpu_ids : list, K : int=30, batch_size : int=10000, M : int=1000) -> None:
+    def update_agent_model(self, model_path : str):
+        self.agent.cost_model.load_weights(model_path)
+
+class ParallelPuzzleDataset(PuzzleDataset):
+    def __init__(self, gpu_ids : list, 
+                 agent: Agent, K: int = 30, batch_size: int = 10000, M: int = 1000) -> None:
+        """
+        与模型训练并行的数据生成器
+
+        Parameters
+        ----------
+        gpu_ids : list
+            使用的 GPU id 列表
+        agent : Agent
+            用于生成 puzzle dataset 的 Agent
+        K : int, default = 30
+            每个 puzzle 的 scrambling steps
+        batch_size : int, default = 10000
+            每个 batch 的大小
+        M : int, default = 1000
+            设置 checking rounds，每次触发 checking round 时，Agent 会学习 batch_size * M 个状态
+        """
+        self.gpu_ids = gpu_ids
+        self.agent = agent
+        self.K = K
+        self.batch_size = batch_size
+        self.M = M
+
+        self.num_of_act = len(self.agent.actions)
+        self.state_len = self.agent.puzzle.state_length
+
+        # create parallel agents
+        puzzle = agent.puzzle
+        actions = agent.actions
+        self.puzzle_datasets = {}
+        for gpu_id in gpu_ids:
+            with tf.device(f"/GPU:{gpu_id}"):
+                puzzle_info_obj = PuzzleInfo(puzzle.puzzle_type, puzzle.goal_state, puzzle.sub_type)
+                puzzle_act_obj = PuzzleAction(puzzle.puzzle_type, actions.moves)
+                cost_model = DeepCube(**agent.cost_model.get_config())
+                cost_model.build(input_shape=(None, puzzle_info_obj.state_length))
+
+                # 初始化 agent
+                agent_ = agent.__class__(puzzle_info_obj, puzzle_act_obj, cost_model)
+                # 在每个 GPU 上创建一个 PuzzleDataset
+                self.puzzle_datasets[gpu_id] = PuzzleDataset(agent_, K, batch_size, M)
+        
+        # 创建 dataset
+        self.dataset = self.create_puzzle_dataset()
+
+    # 在指定 GPU 上创建 batch
+    def create_generator_on_gpu(self, gpu_id):
+        for _ in range(self.M):
+            with tf.device(f"/GPU:{gpu_id}"):
+                init_state, labels, steps = self.puzzle_datasets[gpu_id].generate_batch(self.K)
+            
+            yield init_state, labels, steps
+    
+    # 创建 dataset
+    def create_puzzle_dataset(self):
+        datasets = []
+        for gpu_id in self.gpu_ids:
+            dataset = tf.data.Dataset.from_generator(
+                generator=self.create_generator_on_gpu,
+                args=(gpu_id,),
+                output_signature=(
+                    tf.TensorSpec(shape=(self.batch_size, self.state_len), dtype=tf.int32),
+                    tf.TensorSpec(shape=(self.batch_size, 1), dtype=tf.float32),
+                    tf.TensorSpec(shape=(self.batch_size, 1), dtype=tf.int32))
+                )
+            dataset = dataset.prefetch(tf.data.AUTOTUNE)
+            datasets.append(dataset)
+        
+        choice_dataset = tf.data.Dataset.range(len(self.gpu_ids)).repeat()
+        dataset = tf.data.Dataset.choose_from_datasets(datasets, choice_dataset)
+        dataset = dataset.take(self.M).prefetch(tf.data.AUTOTUNE)
+        
+        return dataset
+
+    def update_agent_model(self, model_path : str):
+        # 更新 agent
+        for gpu_id in self.gpu_ids:
+            with tf.device(f"/GPU:{gpu_id}"):
+                self.puzzle_datasets[gpu_id].agent.cost_model.load_weights(model_path)
+        
+        with tf.device("/CPU:0"):
+            self.agent.cost_model.load_weights(model_path)
+
+
+
+# class ParallelPuzzleDataset(PuzzleDataset):
+#     def __init__(self, gpu_ids : list, 
+#                  agent: Agent, K: int = 30, batch_size: int = 10000, M: int = 1000) -> None:
 #         """
 #         与模型训练并行的数据生成器
 
 #         Parameters
 #         ----------
+#         gpu_ids : list
+#             使用的 GPU id 列表
 #         agent : Agent
 #             用于生成 puzzle dataset 的 Agent
 #         K : int, default = 30
@@ -341,31 +432,73 @@ class PuzzleDataset:
 #         M : int, default = 1000
 #             设置 checking rounds，每次触发 checking round 时，Agent 会学习 batch_size * M 个状态
 #         """
+#         self.gpu_ids = gpu_ids
 #         self.agent = agent
 #         self.K = K
 #         self.batch_size = batch_size
 #         self.M = M
-#         self.gpu_ids = gpu_ids
 
-#     def create_puzzle_dataset(self):
-#         def create_generator(tf_actions, goal_state, num_of_act, state_len):
-#             for _ in range(self.M):
-#                 init_state, labels, steps = self.generate_batch(tf_actions, goal_state, num_of_act, state_len)
-#                 yield init_state, labels, steps
+#         self.num_of_act = len(self.agent.actions)
+#         self.state_len = self.agent.puzzle.state_length
 
-#         # 获取目标状态
-#         goal_state = tf.constant(self.agent.puzzle.goal_state_vec, dtype=tf.int32)
-#         state_len = self.agent.puzzle.state_length
-#         num_of_act = len(self.agent.actions)
-#         tf_actions = tf.stack(list(self.agent.actions.tf_actions.values()))
+#         # create parallel agents
+#         puzzle = agent.puzzle
+#         actions = agent.actions
+#         self.puzzle_datasets = {}
+#         for gpu_id in gpu_ids:
+#             with tf.device(f"/GPU:{gpu_id}"):
+#                 puzzle_info_obj = PuzzleInfo(puzzle.puzzle_type, puzzle.goal_state, puzzle.sub_type)
+#                 puzzle_act_obj = PuzzleAction(puzzle.puzzle_type, actions.moves)
+#                 cost_model = DeepCube(**agent.cost_model.get_config())
+#                 cost_model.build(input_shape=(None, puzzle_info_obj.state_length))
+
+#                 # 初始化 agent
+#                 agent_ = agent.__class__(puzzle_info_obj, puzzle_act_obj, cost_model)
+#                 # 在每个 GPU 上创建一个 PuzzleDataset
+#                 self.puzzle_datasets[gpu_id] = PuzzleDataset(agent_, K, batch_size, M)
         
+#         self.data_queue = Queue(maxsize=2*self.M)
+#         self.excutors = concurrent.futures.ThreadPoolExecutor(max_workers=len(gpu_ids))
+#         # Start the data generation processes
+#         self.threads = [
+#             Thread(target=self.create_generator_on_gpu, args=(gpu_id,)) for gpu_id in gpu_ids
+#         ]
+#         for thread in self.threads:
+#             thread.start()
+
+#         # 创建 dataset
+#         self.dataset = self.create_puzzle_dataset()
+
+#     # 在指定 GPU 上创建 batch
+#     def create_generator_on_gpu(self, gpu_id):
+#         while True:
+#             with tf.device(f"/GPU:{gpu_id}"):
+#                 init_state, labels, steps = self.puzzle_datasets[gpu_id].generate_batch(self.K)
+            
+#             self.data_queue.put((init_state, labels, steps))
+    
+#     # 创建 dataset
+#     def create_puzzle_dataset(self):
+#         def generator():
+#             while True:
+#                 yield self.data_queue.get()
+
 #         dataset = tf.data.Dataset.from_generator(
-#             generator=lambda : create_generator(tf_actions, goal_state, num_of_act, state_len),
+#             generator,
 #             output_signature=(
-#                 tf.TensorSpec(shape=(self.batch_size, state_len), dtype=tf.int32),
+#                 tf.TensorSpec(shape=(self.batch_size, self.state_len), dtype=tf.int32),
 #                 tf.TensorSpec(shape=(self.batch_size, 1), dtype=tf.float32),
 #                 tf.TensorSpec(shape=(self.batch_size, 1), dtype=tf.int32))
-#             )
-#         dataset = dataset.prefetch(tf.data.AUTOTUNE)
+#         )
+#         dataset = dataset.take(self.M).prefetch(tf.data.AUTOTUNE)
+        
+#         return dataset
 
-#         return dataset        
+#     def update_agent_model(self, model_path : str):
+#         # 更新 agent
+#         for gpu_id in self.gpu_ids:
+#             with tf.device(f"/GPU:{gpu_id}"):
+#                 self.puzzle_datasets[gpu_id].agent.cost_model.load_weights(model_path)
+        
+#         with tf.device("/CPU:0"):
+#             self.agent.cost_model.load_weights(model_path)

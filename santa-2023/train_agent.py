@@ -18,7 +18,8 @@ if __name__ == '__main__':
     model_parser = parser.add_argument_group('model')
     train_parser = parser.add_argument_group('train')
 
-    gpu_parser.add_argument('--gpu', type=int, default=0)
+    gpu_parser.add_argument('--gpu', type=str, default="0")
+    gpu_parser.add_argument('--data_gpu', type=str, default=None)
     gpu_parser.add_argument('--memory', type=int, default=30)
 
     # 设置 puzzle
@@ -69,41 +70,43 @@ if __name__ == '__main__':
     # 确定 sub_type
     all_puzzles = pd.DataFrame(puzzles.groupby(by=["puzzle_type", "solution_state"]).indices.keys())
     all_puzzles.columns = ["puzzle_type", "goal_state"]
-    all_puzzles["sub_type"] = all_puzzles.apply(lambda x : get_puzzle_sub_type(x[0], x[1].split(";")), axis=1)
+    all_puzzles["sub_type"] = all_puzzles.apply(lambda x : get_puzzle_sub_type(x.iloc[0], x.iloc[1].split(";")), axis=1)
     all_puzzles.set_index(keys=["puzzle_type","sub_type"], inplace=True)
     
     # 创建 Puzzle 环境
     puzzle_type = args.puzzle_type
     sub_type = args.sub_type
-    puzzle_info_obj = PuzzleInfo(
-        puzzle_type=puzzle_type, goal_state=all_puzzles.loc[(puzzle_type, sub_type), "goal_state"], sub_type=sub_type
-    )
-    puzzle_act_obj = PuzzleAction(
-        puzzle_type=puzzle_type,
-        moves=eval(puzzle_info.loc[puzzle_type, "allowed_moves"]),
-    )
+    with tf.device("/GPU:0"):
+        puzzle_info_obj = PuzzleInfo(
+            puzzle_type=puzzle_type, goal_state=all_puzzles.loc[(puzzle_type, sub_type), "goal_state"], sub_type=sub_type
+        )
+        puzzle_act_obj = PuzzleAction(
+            puzzle_type=puzzle_type,
+            moves=eval(puzzle_info.loc[puzzle_type, "allowed_moves"]),
+        )
 
-    # 创建 model 和 agent
-    cost_model = DeepCube(
-        state_len=puzzle_info_obj.state_length, 
-        state_depth=puzzle_info_obj.state_depth,
-        embed_size=args.embed_size,
-        hidden_size=args.hidden_size,
-        num_layers=args.num_layers,
-        dropout_rate=args.dropout_rate,
-        residual=args.residual,
-        use_one_hot=args.use_one_hot,
-        positional_embedding=args.positional_embedding,
-        num_heads=args.num_heads
-    )
-    cost_model.build(input_shape=(None, puzzle_info_obj.state_length))
-    
-    agent = Agent(puzzle_info_obj, puzzle_act_obj, cost_model, 
-                  name=args.agent_name)
+        # 创建 model 和 agent
+        cost_model = DeepCube(
+            state_len=puzzle_info_obj.state_length, 
+            state_depth=puzzle_info_obj.state_depth,
+            embed_size=args.embed_size,
+            hidden_size=args.hidden_size,
+            num_layers=args.num_layers,
+            dropout_rate=args.dropout_rate,
+            residual=args.residual,
+            use_one_hot=args.use_one_hot,
+            positional_embedding=args.positional_embedding,
+            num_heads=args.num_heads
+        )
+        cost_model.build(input_shape=(None, puzzle_info_obj.state_length))
+        
+        agent = Agent(puzzle_info_obj, puzzle_act_obj, cost_model, 
+                      name=args.agent_name)
     
     # 训练
     agent = train_deepcube_agent(
         agent=agent, 
+        data_gpu=args.data_gpu,
         M=args.M,
         eps=args.eps, 
         K=args.K,

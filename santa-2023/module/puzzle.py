@@ -37,16 +37,17 @@ class PuzzleInfo(Puzzle):
         self.puzzle_type = puzzle_type
         self.sub_type = sub_type
         
-        self.goal_state = goal_state.split(";")
-        self.goal_state_vec = self.to_state_vec(self.goal_state, sub_type)
+        self.goal_state = goal_state
+        self.goal_state_vec = self.to_state_vec(goal_state.split(";"), sub_type)
         
         # 保存 状态长度 state_length 和 每个位置的 状态深度 state_depth
-        self.state_length = len(self.goal_state)
+        self.state_length = len(goal_state.split(";"))
         self.state_depth = max(self.goal_state_vec) + 1 # 从 0 开始计数
 
 class PuzzleAction(Puzzle):
     def __init__(self, puzzle_type : str, moves : dict):
         self.puzzle_type = puzzle_type
+        self.moves = moves
         # 将 moves 转换为 Permutation 对象
         self.actions = {}
         # 保存 tensorflow Permutation 算子

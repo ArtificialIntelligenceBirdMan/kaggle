@@ -11,7 +11,7 @@ from datetime import datetime
 from heapq import heappush, heappop
 
 from .puzzle import PuzzleAction, PuzzleInfo, PuzzleNode
-from .model import DeepCube, PuzzleDataset
+from .model import DeepCube, PuzzleDataset, ParallelPuzzleDataset
 from .utils import Animator, Logger
 
 class Agent:
@@ -161,7 +161,7 @@ class Agent:
         return self.cost_model(state).numpy().squeeze()
 
 
-def train_deepcube_agent(agent : Agent, M : int=5000, eps : float=0.05, K : int=30,
+def train_deepcube_agent(agent : Agent, data_gpu : str=None, M : int=5000, eps : float=0.05, K : int=30,
                          batch_size : int=10000, Epochs : int=1000, lr : float=0.001, warm_up : int=5, 
                          verbose : int=100, save_epoch : int=1000, show : bool=False, pre_train : str=None):
     """
@@ -169,6 +169,8 @@ def train_deepcube_agent(agent : Agent, M : int=5000, eps : float=0.05, K : int=
     ----------
     agent : Agent
         The agent to be trained.
+    data_gpu : str, default = None
+        The gpu device used to generate training data.
     M : int, default = 5000
         The number of the checking rounds.
     eps : float, default = 0.05
@@ -198,6 +200,9 @@ def train_deepcube_agent(agent : Agent, M : int=5000, eps : float=0.05, K : int=
     os.makedirs(model_dir, exist_ok=True)
     os.makedirs(log_dir, exist_ok=True)
 
+    # 训练过程中，保存最新模型的路径
+    update_model_path = f"{model_dir}/{agent.name}_cost_model_update.h5"
+
     # 配置 logger
     if show:
         animator = Animator(xlabel="Epochs", ylabel="metrics", xlim=(1, Epochs),
@@ -209,8 +214,9 @@ def train_deepcube_agent(agent : Agent, M : int=5000, eps : float=0.05, K : int=
 
 
     # 定义损失和优化器
-    optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
-    loss_func = tf.keras.losses.MeanSquaredError(reduction=tf.keras.losses.Reduction.NONE)
+    with tf.device("/GPU:0"):
+        optimizer = tf.keras.optimizers.Adam(learning_rate=lr)
+        loss_func = tf.keras.losses.MeanSquaredError(reduction=tf.keras.losses.Reduction.NONE)
 
     current_K = 1
 
@@ -224,15 +230,28 @@ def train_deepcube_agent(agent : Agent, M : int=5000, eps : float=0.05, K : int=
         except FileNotFoundError:
             msg = "no pre-trained model found, start training from scratch."
         logger.info(0, msg)
-    cost_model_ = DeepCube(**agent.cost_model.get_config())
-    cost_model_.build(input_shape=(None, agent.puzzle.state_length))
-    cost_model_.set_weights(agent.cost_model.get_weights())
-
+    
+    with tf.device("/GPU:0"):
+        cost_model_ = DeepCube(**agent.cost_model.get_config())
+        cost_model_.build(input_shape=(None, agent.puzzle.state_length))
+        cost_model_.set_weights(agent.cost_model.get_weights())
+    cost_model_.save_weights(update_model_path)
+    
     # 记录 agent 更新次数和未更新次数
     update_cnt, not_update_cnt = 0, 0
 
     # 创建数据集
-    dataset = PuzzleDataset(agent, K=current_K, batch_size=batch_size, M=M)
+    if data_gpu is None:
+        dataset = PuzzleDataset(agent, K=current_K, batch_size=batch_size, M=M)
+        msg = f"using Single-GPU mode"
+    else:
+        gpu_ids = [int(i) for i in data_gpu.split(",")]
+        # 创建并行数据集
+        dataset = ParallelPuzzleDataset(gpu_ids, agent, K=current_K, batch_size=batch_size, M=M)
+        dataset.update_agent_model(update_model_path)
+
+        msg = f"using DataGeneration-Parallel mode on GPUs: {gpu_ids}"
+    logger.info(0, msg)
 
     # 记录 loss 和 cost
     loss_metric = tf.keras.metrics.Mean()
@@ -243,15 +262,16 @@ def train_deepcube_agent(agent : Agent, M : int=5000, eps : float=0.05, K : int=
         # 通过 scramble 抽样生成初始状态 init_states 和 标签 steps
         for init_states, labels, steps in dataset:
             # 计算损失
-            with tf.GradientTape() as tape:
-                cost = cost_model_(init_states, training=True)
-                loss = loss_func(labels, cost) # (batch_size, 1)
-                # 在聚合均值时，可以考虑通过 steps 的权重来调整损失
-                loss = tf.reduce_mean(loss)
+            with tf.device("/GPU:0"):
+                with tf.GradientTape() as tape:
+                    cost = cost_model_(init_states, training=True)
+                    loss = loss_func(labels, cost) # (batch_size, 1)
+                    # 在聚合均值时，可以考虑通过 steps 的权重来调整损失
+                    loss = tf.reduce_mean(loss)
             
-            # 更新参数
-            grads = tape.gradient(loss, cost_model_.trainable_variables)
-            optimizer.apply_gradients(zip(grads, cost_model_.trainable_variables))
+                # 更新参数
+                grads = tape.gradient(loss, cost_model_.trainable_variables)
+                optimizer.apply_gradients(zip(grads, cost_model_.trainable_variables))
 
             # 记录到 metric 中
             loss_metric(loss)
@@ -262,11 +282,13 @@ def train_deepcube_agent(agent : Agent, M : int=5000, eps : float=0.05, K : int=
         loss_, cost_ = loss_metric.result().numpy(), cost_metric.result().numpy()
         if loss_ < eps:
             # 拷贝 cost_model_ 的参数到 agent.cost_model
-            agent.cost_model.set_weights(cost_model_.get_weights())
+            cost_model_.save_weights(update_model_path)
+            dataset.update_agent_model(update_model_path)
             msg = f"loss = {loss_:.4f}, mean cost = {cost_:.4f}, agent.cost_model updated."
             logger.info(epoch + 1, msg)
             
             update_cnt += 1
+            not_update_cnt = 0
             # warm up 结束后，修改 K 的值，增加 scrambling 的难度
             if update_cnt == warm_up and current_K < K:
                 msg = f"K = {current_K} stage warm up stop, "
@@ -281,7 +303,8 @@ def train_deepcube_agent(agent : Agent, M : int=5000, eps : float=0.05, K : int=
             # 记录未更新的次数，如果连续 500 次未更新，则强制更新
             not_update_cnt += 1
             if not_update_cnt == 500:
-                agent.cost_model.set_weights(cost_model_.get_weights())
+                cost_model_.save_weights(update_model_path)
+                dataset.update_agent_model(update_model_path)
                 msg = f"loss = {loss_:.4f}, mean cost = {cost_:.4f}, agent.cost_model not updated for 500 epochs, force update."
                 logger.info(epoch + 1, msg)
                 not_update_cnt = 0

@@ -35,6 +35,8 @@ def gpu_limitation_config(memory : int=30, device : Union[int,list]=0):
             os.environ["CUDA_VISIBLE_DEVICES"] = str(device)
         elif isinstance(device, list):
             os.environ["CUDA_VISIBLE_DEVICES"] = ",".join([str(i) for i in device])
+        elif isinstance(device, str):
+            os.environ["CUDA_VISIBLE_DEVICES"] = device
     else:
         os.environ["CUDA_VISIBLE_DEVICES"] = "0"
     
